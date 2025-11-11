@@ -1405,7 +1405,6 @@ function corsForOrderTracking(req, res, next) {
 
 // --- 2️⃣ Order Tracking Endpoint ---
 app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
-  res.sendStatus(200);
   try {
     const { order, email, order_id } = req.query;
 
