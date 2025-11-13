@@ -1442,15 +1442,49 @@ app.options("/order-tracking", corsForOrderTracking, (req, res) => {
         arr.push(last10(o?.customer?.phone));
         arr.push(last10(o?.customer?.default_address?.phone));
         arr.push(last10(o?.phone));
-        arr.push(last10(o?.contact_email));
+        // Sometimes captured in note attributes under various keys
         if (Array.isArray(o.note_attributes)) {
           o.note_attributes.forEach((attr) => {
-            if (attr.name && attr.name.toLowerCase().includes("phone")) {
+            const key = (attr.name || "").toLowerCase();
+            if (
+              key.includes("phone") ||
+              key.includes("whatsapp") ||
+              key.includes("mobile") ||
+              key.includes("contact")
+            ) {
               arr.push(last10(attr.value));
             }
           });
         }
         return arr.filter(Boolean);
+      };
+
+      const getCandidateNames = (o) => {
+        const names = [];
+        const cust = o.customer || {};
+        const ship = o.shipping_address || {};
+        const bill = o.billing_address || {};
+        const join = (a, b) => [a || "", b || ""].join(" ").trim();
+        names.push(join(cust.first_name, cust.last_name));
+        names.push(join(ship.first_name, ship.last_name));
+        names.push(join(bill.first_name, bill.last_name));
+        return names
+          .filter(Boolean)
+          .map((n) => n.toString().trim())
+          .map((n) => n.toLowerCase());
+      };
+
+      const nameMatches = (o, targetName) => {
+        const tokens = targetName
+          .split(/\s+/)
+          .filter(Boolean)
+          .map((t) => t.toLowerCase());
+        const candidates = getCandidateNames(o);
+        if (!tokens.length || !candidates.length) return false;
+        return candidates.some((cand) =>
+          // either full target is substring, or all tokens appear
+          cand.includes(targetName) || tokens.every((t) => cand.includes(t))
+        );
       };
 
       // Name + phone lookup
@@ -1475,24 +1509,21 @@ app.options("/order-tracking", corsForOrderTracking, (req, res) => {
           });
         }
 
-        const matchedFinal = matchedByPhone.filter((o) => {
-          const full = clean(
-            `${o.customer?.first_name || ""} ${o.customer?.last_name || ""}`
-          );
-          return full.includes(targetName);
-        });
+        const matchedFinal = matchedByPhone.filter((o) =>
+          nameMatches(o, targetName)
+        );
 
         if (!matchedFinal.length) {
+          // Still return tracking for phone-only matches to be helpful
+          const results = [];
+          for (const o of matchedByPhone) {
+            const f = await getFulfillment(o.id);
+            results.push({ id: o.id, name: o.name, tracking: formatTracking(f) });
+          }
           return res.json({
             warning:
-              "Phone matched but the customer name did not match. Showing phone-matched orders.",
-            orders: matchedByPhone.map((o) => ({
-              id: o.id,
-              name: o.name,
-              customer_name: `${o.customer?.first_name || ""} ${
-                o.customer?.last_name || ""
-              }`,
-            })),
+              "Phone matched but the customer name did not match. Returning phone-matched orders.",
+            orders: results,
           });
         }
 
