@@ -1492,15 +1492,57 @@ app.options("/order-tracking", corsForOrderTracking, (req, res) => {
         const target = last10(phone);
         const targetName = clean(name);
 
-        const resp = await client.get({
-          path: "orders",
-          query: { status: "any", limit: 250 },
-        });
+        const resp = await client.get({ path: "orders", query: { status: "any", limit: 250 } });
 
-        const orders = resp.body.orders || [];
-        const matchedByPhone = orders.filter((o) =>
-          extractPhones(o).some((p) => p === target)
-        );
+        let orders = resp.body.orders || [];
+        let matchedByPhone = orders.filter((o) => extractPhones(o).some((p) => p === target));
+
+        // Fallback: if no recent orders match by phone, search customers by phone and fetch their orders
+        if (!matchedByPhone.length) {
+          const phoneVariants = (() => {
+            const v = [];
+            // bare last 10, +<last10>, country-specific
+            v.push(target);
+            v.push(`+${target}`);
+            v.push(`+91${target}`);
+            v.push(`91${target}`);
+            v.push(`+1${target}`);
+            return v;
+          })();
+
+          let customers = [];
+          for (const pv of phoneVariants) {
+            try {
+              const c = await client.get({
+                path: "customers/search",
+                query: { query: `phone:${pv}` },
+              });
+              if (Array.isArray(c.body.customers) && c.body.customers.length) {
+                customers = c.body.customers;
+                break;
+              }
+            } catch (e) {
+              // ignore and try next variant
+            }
+          }
+
+          if (customers.length) {
+            const allOrders = [];
+            for (const cust of customers) {
+              try {
+                const o = await client.get({
+                  path: "orders",
+                  query: { status: "any", limit: 250, customer_id: cust.id },
+                });
+                if (Array.isArray(o.body.orders)) allOrders.push(...o.body.orders);
+              } catch (e) {
+                // continue
+              }
+            }
+            orders = allOrders;
+            matchedByPhone = orders.filter((o) => extractPhones(o).some((p) => p === target));
+          }
+        }
 
         if (!matchedByPhone.length) {
           return res.json({
