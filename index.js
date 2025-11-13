@@ -1450,11 +1450,17 @@ app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
         const orders = response.body.orders || [];
 
         // Filter by phone (billing OR shipping)
+        // Filter by phone (billing OR shipping)
+        const digits = (v) => v?.toString().replace(/[^0-9]/g, "");
+        
         const phoneMatched = orders.filter((o) => {
-          const p1 = clean(o?.billing_address?.phone);
-          const p2 = clean(o?.shipping_address?.phone);
-          return p1?.includes(clean(phone)) || p2?.includes(clean(phone));
+          const billingPhone = digits(o?.billing_address?.phone);
+          const shippingPhone = digits(o?.shipping_address?.phone);
+          const target = digits(phone);
+        
+          return billingPhone?.endsWith(target) || shippingPhone?.endsWith(target);
         });
+
 
         if (!phoneMatched.length) {
           return res.status(404).json({
