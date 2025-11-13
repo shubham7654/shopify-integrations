@@ -1404,35 +1404,35 @@ function corsForOrderTracking(req, res, next) {
   res.status(403).json({ error: "CORS blocked. Unauthorized origin.", origin });
 }
 
-// --- 2️⃣ Order Tracking Endpoint ---
 app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
   try {
     const { order, order_id, name, phone } = req.query;
 
+    // -------------------------------
+    // Helpers
+    // -------------------------------
     const clean = (v) => v?.toString().trim().toLowerCase();
     const digits = (v) => v?.toString().replace(/[^0-9]/g, "");
+    const last10 = (v) => digits(v).slice(-10);
 
     /* -------------------------------------------------------
-       Helper → Get latest fulfillment (may be null)
+       Helper → Fetch latest fulfillment (may return null)
     ------------------------------------------------------- */
     async function getFulfillment(orderId) {
       try {
         const fulRes = await client.get({
           path: `orders/${orderId}/fulfillments`,
         });
-
         const list = fulRes.body.fulfillments || [];
-        if (!list.length) return null;
-
-        return list[list.length - 1];
+        return list.length ? list[list.length - 1] : null;
       } catch (err) {
-        console.error("❌ Fulfillment error:", err.response?.data || err);
+        console.error("❌ Fulfillment fetch error:", err.response?.data || err);
         return null;
       }
     }
 
     /* -------------------------------------------------------
-       Helper → Format tracking block
+       Helper → Format tracking response consistently
     ------------------------------------------------------- */
     function formatTracking(latest) {
       return latest
@@ -1457,63 +1457,61 @@ app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
     // ==========================================================
     if (name && phone) {
       try {
-        const targetDigitPhone = digits(phone);
+        const target10 = last10(phone); // Customer phone last 10 digits
 
-        // Fetch many orders
+        // Fetch many orders from Shopify
         const resp = await client.get({
           path: "orders",
-          query: {
-            status: "any",
-            limit: 250,
-          },
+          query: { status: "any", limit: 250 },
         });
 
         const orders = resp.body.orders || [];
 
-        // Match by phone (billing OR shipping) → last digits compare
+        // 🔍 Match by last 10 digits of phone (billing OR shipping)
         const phoneMatches = orders.filter((o) => {
-          const bp = digits(o?.billing_address?.phone);
-          const sp = digits(o?.shipping_address?.phone);
-          return bp?.endsWith(targetDigitPhone) || sp?.endsWith(targetDigitPhone);
+          const bp = last10(o?.billing_address?.phone);
+          const sp = last10(o?.shipping_address?.phone);
+          return bp === target10 || sp === target10;
         });
 
         if (!phoneMatches.length) {
           return res.status(404).json({
             error: "No orders found with this phone number.",
+            orders: [],
           });
         }
 
-        // Match by customer name
+        // 🔍 Match by name (partial allowed)
         const cleanName = clean(name);
         const exactMatches = phoneMatches.filter((o) => {
           const full = clean(
-            (o.customer?.first_name || "") + " " + (o.customer?.last_name || "")
+            `${o.customer?.first_name || ""} ${o.customer?.last_name || ""}`
           );
           return full.includes(cleanName);
         });
 
         if (!exactMatches.length) {
           return res.status(404).json({
-            error: "Phone matched but no matching customer name.",
+            error: "Phone matched but customer name did not match.",
+            orders: [],
           });
         }
 
-        // 🔥 GET FULFILLMENT FOR EACH ORDER
+        // 🔥 Fetch fulfillment for each order
         const result = [];
 
         for (const ord of exactMatches) {
-          const fulfill = await getFulfillment(ord.id);
-
+          const f = await getFulfillment(ord.id);
           result.push({
             id: ord.id,
             name: ord.name,
-            tracking: formatTracking(fulfill),
+            tracking: formatTracking(f),
           });
         }
 
         return res.json({ orders: result });
       } catch (err) {
-        console.error("❌ Name+Phone error:", err.response?.data || err);
+        console.error("❌ Name+Phone lookup error:", err);
         return res.status(500).json({ error: "Failed to fetch by Name + Phone" });
       }
     }
@@ -1524,6 +1522,7 @@ app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
     if (!order && !order_id) {
       return res.status(400).json({
         error: "Provide order number (KAJ1001) or order_id.",
+        orders: [],
       });
     }
 
@@ -1531,7 +1530,7 @@ app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
 
     if (order && !order_id) {
       try {
-        const orderRes = await client.get({
+        const oRes = await client.get({
           path: "orders",
           query: {
             name: `#${order.replace("#", "")}`,
@@ -1540,23 +1539,25 @@ app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
           },
         });
 
-        const found = orderRes.body.orders?.[0];
+        const found = oRes.body.orders?.[0];
         if (!found) {
           return res.status(404).json({
             error: `No order found with number ${order}`,
+            orders: [],
           });
         }
 
         targetOrderId = found.id;
       } catch (err) {
-        console.error("❌ Order lookup error:", err.response?.data || err);
+        console.error("❌ Order-number lookup error:", err);
         return res.status(500).json({
           error: "Failed to fetch order by order number.",
+          orders: [],
         });
       }
     }
 
-    // Fetch fulfillment
+    // 🔍 Fetch fulfillment for single order
     const fulfill = await getFulfillment(targetOrderId);
 
     return res.json({
@@ -1569,7 +1570,7 @@ app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
       ],
     });
   } catch (error) {
-    console.error("🔥 Unhandled error:", error.response?.data || error);
+    console.error("🔥 Unhandled error:", error);
     return res.status(500).json({ error: "Internal server error" });
   }
 });
