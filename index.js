@@ -1406,34 +1406,35 @@ function corsForOrderTracking(req, res, next) {
 
 app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
   try {
-    const { order, order_id, name, phone } = req.query;
+    const { order, order_id, name, phone, debug } = req.query;
+    const wantDebug = debug === "true";
 
-    // -------------------------------
-    // Helpers
-    // -------------------------------
-    const clean = (v) => v?.toString().trim().toLowerCase();
-    const digits = (v) => v?.toString().replace(/[^0-9]/g, "");
+    const clean = (v) => (v === undefined || v === null ? "" : v.toString().trim().toLowerCase());
+    const digits = (v) => (v === undefined || v === null ? "" : v.toString().replace(/[^0-9]/g, ""));
     const last10 = (v) => digits(v).slice(-10);
 
-    /* -------------------------------------------------------
-       Helper → Fetch latest fulfillment (may return null)
-    ------------------------------------------------------- */
+    const debugLog = (obj) => {
+      if (!wantDebug) return;
+      // accumulate debug info in response later via debugInfo variable
+      debugInfo.push(obj);
+    };
+
+    let debugInfo = [];
+    debugLog({ incomingQuery: { order, order_id, name, phone } });
+
     async function getFulfillment(orderId) {
       try {
-        const fulRes = await client.get({
-          path: `orders/${orderId}/fulfillments`,
-        });
-        const list = fulRes.body.fulfillments || [];
+        const fulRes = await client.get({ path: `orders/${orderId}/fulfillments` });
+        const list = fulRes.body?.fulfillments || [];
+        debugLog({ getFulfillment_orderId: orderId, fulfillmentsCount: list.length });
         return list.length ? list[list.length - 1] : null;
       } catch (err) {
         console.error("❌ Fulfillment fetch error:", err.response?.data || err);
+        debugLog({ getFulfillment_error: err.response?.data || err.message || String(err) });
         return null;
       }
     }
 
-    /* -------------------------------------------------------
-       Helper → Format tracking response consistently
-    ------------------------------------------------------- */
     function formatTracking(latest) {
       return latest
         ? {
@@ -1452,114 +1453,138 @@ app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
           };
     }
 
-    // ==========================================================
-    // 1️⃣ NAME + PHONE LOOKUP (MULTIPLE ORDERS)
-    // ==========================================================
+    // -------------------- NAME + PHONE path --------------------
     if (name && phone) {
       try {
-        const target10 = last10(phone); // Customer phone last 10 digits
+        const target10 = last10(phone);
+        debugLog({ target_phone_last10: target10 });
 
-        // Fetch many orders from Shopify
+        // Fetch recent orders; increase limit if you need deeper search (caution: rate limits)
         const resp = await client.get({
           path: "orders",
           query: { status: "any", limit: 250 },
         });
+        const orders = resp.body?.orders || [];
+        debugLog({ totalOrdersFetched: orders.length });
 
-        const orders = resp.body.orders || [];
-
-        // 🔍 Match by last 10 digits of phone (billing OR shipping)
+        // Primary phone match: check billing/shipping/customer phone last10
         const phoneMatches = orders.filter((o) => {
-          const bp = last10(o?.billing_address?.phone);
-          const sp = last10(o?.shipping_address?.phone);
-          return bp === target10 || sp === target10;
+          const billing = last10(o?.billing_address?.phone);
+          const shipping = last10(o?.shipping_address?.phone);
+          const custPhone = last10(o?.customer?.phone);
+          return billing === target10 || shipping === target10 || custPhone === target10;
         });
+        debugLog({ phoneMatchesCount: phoneMatches.length });
 
+        // If no phoneMatches — try looser match: contains (sometimes leading zeros/formatting)
+        let fallbackPhoneMatches = [];
         if (!phoneMatches.length) {
+          fallbackPhoneMatches = orders.filter((o) => {
+            const billing = digits(o?.billing_address?.phone);
+            const shipping = digits(o?.shipping_address?.phone);
+            const custPhone = digits(o?.customer?.phone);
+            return (
+              billing.includes(target10) ||
+              shipping.includes(target10) ||
+              custPhone.includes(target10)
+            );
+          });
+          debugLog({ fallbackPhoneMatchesCount: fallbackPhoneMatches.length });
+        }
+
+        const matchedPool = phoneMatches.length ? phoneMatches : fallbackPhoneMatches;
+        if (!matchedPool.length) {
+          debugLog({ reason: "no_phone_matches_in_orders" });
           return res.status(404).json({
             error: "No orders found with this phone number.",
             orders: [],
+            debug: wantDebug ? debugInfo : undefined,
           });
         }
 
-        // 🔍 Match by name (partial allowed)
-        const cleanName = clean(name);
-        const exactMatches = phoneMatches.filter((o) => {
-          const full = clean(
-            `${o.customer?.first_name || ""} ${o.customer?.last_name || ""}`
-          );
-          return full.includes(cleanName);
+        // Match by name (partial match)
+        const wantName = clean(name);
+        const exactMatches = matchedPool.filter((o) => {
+          const full = clean(`${o.customer?.first_name || ""} ${o.customer?.last_name || ""}`);
+          return full.includes(wantName);
         });
+        debugLog({ exactMatchesCount: exactMatches.length });
 
         if (!exactMatches.length) {
-          return res.status(404).json({
-            error: "Phone matched but customer name did not match.",
-            orders: [],
+          // return the phone-matched orders (without name match) but mark as such - helpful for debugging / UX
+          debugLog({ reason: "phone_matched_but_name_did_not_match", matchedPoolCount: matchedPool.length });
+          // Prepare a lightweight response of the phone-matched orders (so UI can display them and user can pick)
+          const minimal = matchedPool.map((o) => ({
+            id: o.id,
+            name: o.name,
+            customer_name: `${o.customer?.first_name || ""} ${o.customer?.last_name || ""}`.trim(),
+          }));
+          return res.status(200).json({
+            warning: "Phone matched but customer name did not match. Showing phone-matched orders for review.",
+            orders: minimal,
+            debug: wantDebug ? debugInfo : undefined,
           });
         }
 
-        // 🔥 Fetch fulfillment for each order
-        const result = [];
-
+        // For each exact match, attach tracking (may be null => placeholder)
+        const results = [];
         for (const ord of exactMatches) {
-          const f = await getFulfillment(ord.id);
-          result.push({
+          const fulfillment = await getFulfillment(ord.id);
+          results.push({
             id: ord.id,
             name: ord.name,
-            tracking: formatTracking(f),
+            tracking: formatTracking(fulfillment),
           });
         }
 
-        return res.json({ orders: result });
+        return res.json({ orders: results, debug: wantDebug ? debugInfo : undefined });
       } catch (err) {
-        console.error("❌ Name+Phone lookup error:", err);
-        return res.status(500).json({ error: "Failed to fetch by Name + Phone" });
+        console.error("❌ Name+Phone lookup error:", err.response?.data || err);
+        return res.status(500).json({
+          error: "Failed to fetch by Name + Phone",
+          debug: wantDebug ? debugInfo.concat({ error: err.response?.data || err.message || String(err) }) : undefined,
+        });
       }
     }
 
-    // ==========================================================
-    // 2️⃣ ORDER NUMBER / ORDER ID LOOKUP (Single order)
-    // ==========================================================
+    // -------------------- ORDER or ORDER_ID path --------------------
     if (!order && !order_id) {
       return res.status(400).json({
-        error: "Provide order number (KAJ1001) or order_id.",
+        error: "Provide order (KAJ1001) or order_id.",
         orders: [],
+        debug: wantDebug ? debugInfo : undefined,
       });
     }
 
     let targetOrderId = order_id;
-
     if (order && !order_id) {
       try {
-        const oRes = await client.get({
+        const orderRes = await client.get({
           path: "orders",
-          query: {
-            name: `#${order.replace("#", "")}`,
-            status: "any",
-            limit: 1,
-          },
+          query: { name: `#${order.replace("#", "")}`, status: "any", limit: 1 },
         });
-
-        const found = oRes.body.orders?.[0];
+        const found = orderRes.body?.orders?.[0];
+        debugLog({ orderLookupFound: !!found, foundSample: found ? { id: found.id, name: found.name } : null });
         if (!found) {
           return res.status(404).json({
             error: `No order found with number ${order}`,
             orders: [],
+            debug: wantDebug ? debugInfo : undefined,
           });
         }
-
         targetOrderId = found.id;
       } catch (err) {
-        console.error("❌ Order-number lookup error:", err);
+        console.error("❌ Order-number lookup error:", err.response?.data || err);
         return res.status(500).json({
           error: "Failed to fetch order by order number.",
           orders: [],
+          debug: wantDebug ? debugInfo.concat({ error: err.response?.data || err.message || String(err) }) : undefined,
         });
       }
     }
 
-    // 🔍 Fetch fulfillment for single order
+    // Fetch fulfillment (may be null). We still return order with placeholder tracking.
     const fulfill = await getFulfillment(targetOrderId);
-
     return res.json({
       orders: [
         {
@@ -1568,10 +1593,11 @@ app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
           tracking: formatTracking(fulfill),
         },
       ],
+      debug: wantDebug ? debugInfo : undefined,
     });
   } catch (error) {
-    console.error("🔥 Unhandled error:", error);
-    return res.status(500).json({ error: "Internal server error" });
+    console.error("🔥 Unhandled error:", error.response?.data || error);
+    return res.status(500).json({ error: "Internal server error", debug: wantDebug ? { error: error?.message || String(error) } : undefined });
   }
 });
 
