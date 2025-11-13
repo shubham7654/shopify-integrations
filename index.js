@@ -1408,7 +1408,6 @@ app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
   try {
     const { order, order_id, name, phone } = req.query;
 
-    // --- UTIL HELPERS ---
     const clean = (v) =>
       v ? v.toString().trim().toLowerCase() : "";
 
@@ -1417,134 +1416,174 @@ app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
 
     const last10 = (v) => digits(v).slice(-10);
 
+    /* -----------------------------------
+       GET LATEST FULFILLMENT
+    ----------------------------------- */
     async function getFulfillment(orderId) {
       try {
-        const fulRes = await client.get({
+        const f = await client.get({
           path: `orders/${orderId}/fulfillments`,
         });
-        const list = fulRes.body?.fulfillments || [];
+        const list = f.body.fulfillments || [];
         return list.length ? list[list.length - 1] : null;
-      } catch (err) {
+      } catch {
         return null;
       }
     }
 
-    function formatTracking(ful) {
-      return ful
-        ? {
-            tracking_number: ful.tracking_number || "Not Available",
-            tracking_url: ful.tracking_url || null,
-            courier: ful.tracking_company || "Not Specified",
-            status: ful.shipment_status || "pending",
-            estimated_delivery: ful.estimated_delivery_at || null,
-          }
-        : {
-            tracking_number: "Not Available",
-            tracking_url: null,
-            courier: "Not Specified",
-            status: "pending",
-            estimated_delivery: null,
-          };
-    }
+    /* -----------------------------------
+       FORMAT TRACKING BLOCK
+    ----------------------------------- */
+    const formatTracking = (f) => ({
+      tracking_number: f?.tracking_number || "Not Available",
+      tracking_url: f?.tracking_url || null,
+      courier: f?.tracking_company || "Not Specified",
+      status: f?.shipment_status || "pending",
+      estimated_delivery: f?.estimated_delivery_at || null,
+    });
 
-    // ============================================================
-    // ⭐ NAME + PHONE SEARCH (supports multiple orders)
-    // ============================================================
+    /* -----------------------------------
+       EXTRACT PHONE FROM ALL FIELDS
+    ----------------------------------- */
+    const extractPhones = (o) => {
+      const arr = [];
+
+      arr.push(last10(o?.billing_address?.phone));
+      arr.push(last10(o?.shipping_address?.phone));
+      arr.push(last10(o?.customer?.phone));
+      arr.push(last10(o?.customer?.default_address?.phone));
+      arr.push(last10(o?.phone)); // sometimes Shopify stores here
+      arr.push(last10(o?.contact_email)); // some gateways store phone here
+
+      // NOTE ATTRIBUTES (VERY COMMON FOR COD / WHATSAPP CHECKOUTS)
+      if (Array.isArray(o.note_attributes)) {
+        o.note_attributes.forEach((attr) => {
+          if (attr.name.toLowerCase().includes("phone"))
+            arr.push(last10(attr.value));
+        });
+      }
+
+      // Remove blanks
+      return arr.filter((x) => x);
+    };
+
+    /* ======================================================
+       NAME + PHONE LOOKUP
+    ====================================================== */
     if (name && phone) {
-      const phone10 = last10(phone);
-      const nameClean = clean(name);
+      const target = last10(phone);
+      const targetName = clean(name);
 
-      // Fetch many orders
+      // Fetch orders
       const resp = await client.get({
         path: "orders",
-        query: {
-          status: "any",
-          limit: 250,
-        },
+        query: { status: "any", limit: 250 },
       });
 
       const orders = resp.body.orders || [];
+      const matchedByPhone = [];
 
-      // Try matching phone from many fields
-      const phoneMatches = orders.filter((o) => {
-        const p1 = last10(o?.billing_address?.phone);
-        const p2 = last10(o?.shipping_address?.phone);
-        const p3 = last10(o?.customer?.phone);
-        const p4 = last10(o?.customer?.default_address?.phone);
-
-        return [p1, p2, p3, p4].includes(phone10);
+      // Match ALL phone fields
+      orders.forEach((o) => {
+        const phones = extractPhones(o);
+        if (phones.some((p) => p === target)) {
+          matchedByPhone.push(o);
+        }
       });
 
-      if (!phoneMatches.length) {
-        return res.json({ orders: [] }); // Always return empty instead of error
+      if (!matchedByPhone.length) {
+        return res.json({
+          orders: [],
+          error: "No orders found for this phone number.",
+        });
       }
 
-      // try matching by name
-      const strongMatches = phoneMatches.filter((o) => {
+      // Match name (partial)
+      const matchedFinal = matchedByPhone.filter((o) => {
         const full = clean(
           `${o.customer?.first_name || ""} ${o.customer?.last_name || ""}`
         );
-        return full.includes(nameClean);
+        return full.includes(targetName);
       });
 
-      const finalList = strongMatches.length ? strongMatches : phoneMatches;
+      if (!matchedFinal.length) {
+        return res.json({
+          warning:
+            "Phone matched but the customer name did not match. Showing phone-matched orders.",
+          orders: matchedByPhone.map((o) => ({
+            id: o.id,
+            name: o.name,
+            customer_name: `${o.customer?.first_name || ""} ${
+              o.customer?.last_name || ""
+            }`,
+          })),
+        });
+      }
 
-      // attach tracking (fulfilled or not)
+      // Attach tracking to each
       const results = [];
-      for (const o of finalList) {
-        const ful = await getFulfillment(o.id);
+      for (const o of matchedFinal) {
+        const f = await getFulfillment(o.id);
         results.push({
           id: o.id,
           name: o.name,
-          tracking: formatTracking(ful),
+          tracking: formatTracking(f),
         });
       }
 
       return res.json({ orders: results });
     }
 
-    // ============================================================
-    // ⭐ ORDER NUMBER SEARCH (single order)
-    // ============================================================
+    /* ======================================================
+       ORDER NUMBER LOOKUP
+    ====================================================== */
     if (!order && !order_id) {
-      return res.json({ orders: [] });
+      return res.json({
+        orders: [],
+        error: "Provide order number or order_id.",
+      });
     }
 
-    let finalOrderId = order_id;
+    let targetID = order_id;
 
-    if (order) {
+    if (order && !order_id) {
       const resp = await client.get({
         path: "orders",
         query: {
           name: `#${order.replace("#", "")}`,
-          status: "any",
           limit: 1,
+          status: "any",
         },
       });
 
       const found = resp.body.orders?.[0];
-      if (!found) return res.json({ orders: [] });
-
-      finalOrderId = found.id;
+      if (!found) {
+        return res.json({
+          error: `No order found with number ${order}`,
+          orders: [],
+        });
+      }
+      targetID = found.id;
     }
 
-    const ful = await getFulfillment(finalOrderId);
+    const f = await getFulfillment(targetID);
 
     return res.json({
       orders: [
         {
-          id: finalOrderId,
-          name: `#${order || finalOrderId}`,
-          tracking: formatTracking(ful),
+          id: targetID,
+          name: `#${order || targetID}`,
+          tracking: formatTracking(f),
         },
       ],
     });
   } catch (err) {
-    console.error(err);
-    return res.json({ orders: [] });
+    return res.status(500).json({
+      error: "Internal server error",
+      details: err.message,
+    });
   }
 });
-
 // --- Start server ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
