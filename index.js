@@ -1412,104 +1412,115 @@ app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
     const clean = (v) => v?.toString().trim().toLowerCase();
     const digits = (v) => v?.toString().replace(/[^0-9]/g, "");
 
-    /* -------------------------------------------
-       Helper → Fetch latest fulfillment for order
-    -------------------------------------------- */
+    /* -------------------------------------------------------
+       Helper → Get latest fulfillment (may be null)
+    ------------------------------------------------------- */
     async function getFulfillment(orderId) {
       try {
         const fulRes = await client.get({
           path: `orders/${orderId}/fulfillments`,
         });
 
-        const fs = fulRes.body.fulfillments || [];
-        if (!fs.length) return null;
+        const list = fulRes.body.fulfillments || [];
+        if (!list.length) return null;
 
-        return fs[fs.length - 1];
+        return list[list.length - 1];
       } catch (err) {
         console.error("❌ Fulfillment error:", err.response?.data || err);
         return null;
       }
     }
 
-    /* ============================================================
-       1️⃣ SEARCH BY NAME + PHONE
-    ============================================================ */
+    /* -------------------------------------------------------
+       Helper → Format tracking block
+    ------------------------------------------------------- */
+    function formatTracking(latest) {
+      return latest
+        ? {
+            tracking_number: latest.tracking_number || "Not Available",
+            tracking_url: latest.tracking_url || null,
+            courier: latest.tracking_company || "Not Specified",
+            status: latest.shipment_status || "pending",
+            estimated_delivery: latest.estimated_delivery_at || null,
+          }
+        : {
+            tracking_number: "Not Available",
+            tracking_url: null,
+            courier: "Not Specified",
+            status: "pending",
+            estimated_delivery: null,
+          };
+    }
+
+    // ==========================================================
+    // 1️⃣ NAME + PHONE LOOKUP (MULTIPLE ORDERS)
+    // ==========================================================
     if (name && phone) {
       try {
-        const all = await client.get({
+        const targetDigitPhone = digits(phone);
+
+        // Fetch many orders
+        const resp = await client.get({
           path: "orders",
-          query: { status: "any", limit: 250 },
+          query: {
+            status: "any",
+            limit: 250,
+          },
         });
 
-        const orders = all.body.orders || [];
+        const orders = resp.body.orders || [];
 
-        // 1) Match Phone (billing or shipping) → only digits
-        const target = digits(phone);
-
-        const phoneMatched = orders.filter((o) => {
+        // Match by phone (billing OR shipping) → last digits compare
+        const phoneMatches = orders.filter((o) => {
           const bp = digits(o?.billing_address?.phone);
           const sp = digits(o?.shipping_address?.phone);
-
-          return bp?.endsWith(target) || sp?.endsWith(target);
+          return bp?.endsWith(targetDigitPhone) || sp?.endsWith(targetDigitPhone);
         });
 
-        if (!phoneMatched.length) {
+        if (!phoneMatches.length) {
           return res.status(404).json({
-            error: "Orders found, but no matching phone number.",
+            error: "No orders found with this phone number.",
           });
         }
 
-        // 2) Match Name
-        const bestMatch = phoneMatched.find((o) => {
-          const fullName = clean(
-            (o.customer?.first_name || "") +
-              " " +
-              (o.customer?.last_name || "")
+        // Match by customer name
+        const cleanName = clean(name);
+        const exactMatches = phoneMatches.filter((o) => {
+          const full = clean(
+            (o.customer?.first_name || "") + " " + (o.customer?.last_name || "")
           );
-          return fullName.includes(clean(name));
+          return full.includes(cleanName);
         });
 
-        if (!bestMatch) {
+        if (!exactMatches.length) {
           return res.status(404).json({
             error: "Phone matched but no matching customer name.",
           });
         }
 
-        // 3) Fetch fulfillment (may be NULL)
-        const latest = await getFulfillment(bestMatch.id);
+        // 🔥 GET FULFILLMENT FOR EACH ORDER
+        const result = [];
 
-        return res.json({
-          order: {
-            id: bestMatch.id,
-            name: bestMatch.name,
-            tracking: latest
-              ? {
-                  tracking_number: latest.tracking_number || "Not Available",
-                  tracking_url: latest.tracking_url || null,
-                  courier: latest.tracking_company || "Not Specified",
-                  status: latest.shipment_status || "pending",
-                  estimated_delivery: latest.estimated_delivery_at || null,
-                }
-              : {
-                  tracking_number: "Not Available",
-                  tracking_url: null,
-                  courier: "Not Specified",
-                  status: "pending",
-                  estimated_delivery: null,
-                },
-          },
-        });
+        for (const ord of exactMatches) {
+          const fulfill = await getFulfillment(ord.id);
+
+          result.push({
+            id: ord.id,
+            name: ord.name,
+            tracking: formatTracking(fulfill),
+          });
+        }
+
+        return res.json({ orders: result });
       } catch (err) {
         console.error("❌ Name+Phone error:", err.response?.data || err);
-        return res
-          .status(500)
-          .json({ error: "Failed to fetch by Name + Phone" });
+        return res.status(500).json({ error: "Failed to fetch by Name + Phone" });
       }
     }
 
-    /* ============================================================
-       2️⃣ SEARCH BY ORDER NUMBER
-    ============================================================ */
+    // ==========================================================
+    // 2️⃣ ORDER NUMBER / ORDER ID LOOKUP (Single order)
+    // ==========================================================
     if (!order && !order_id) {
       return res.status(400).json({
         error: "Provide order number (KAJ1001) or order_id.",
@@ -1520,7 +1531,7 @@ app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
 
     if (order && !order_id) {
       try {
-        const r = await client.get({
+        const orderRes = await client.get({
           path: "orders",
           query: {
             name: `#${order.replace("#", "")}`,
@@ -1529,8 +1540,7 @@ app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
           },
         });
 
-        const found = r.body.orders?.[0];
-
+        const found = orderRes.body.orders?.[0];
         if (!found) {
           return res.status(404).json({
             error: `No order found with number ${order}`,
@@ -1539,41 +1549,24 @@ app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
 
         targetOrderId = found.id;
       } catch (err) {
-        console.error("❌ Order number lookup error:", err.response?.data || err);
+        console.error("❌ Order lookup error:", err.response?.data || err);
         return res.status(500).json({
           error: "Failed to fetch order by order number.",
         });
       }
     }
 
-    /* ============================================================
-       3️⃣ FETCH FULFILLMENT FOR FINAL ORDER ID
-    ============================================================ */
-    const latest = await getFulfillment(targetOrderId);
-
-    // If fulfillment missing → return pending details, DO NOT throw error
-    const trackingInfo = latest
-      ? {
-          tracking_number: latest.tracking_number || "Not Available",
-          tracking_url: latest.tracking_url || null,
-          courier: latest.tracking_company || "Not Specified",
-          status: latest.shipment_status || "pending",
-          estimated_delivery: latest.estimated_delivery_at || null,
-        }
-      : {
-          tracking_number: "Not Available",
-          tracking_url: null,
-          courier: "Not Specified",
-          status: "pending",
-          estimated_delivery: null,
-        };
+    // Fetch fulfillment
+    const fulfill = await getFulfillment(targetOrderId);
 
     return res.json({
-      order: {
-        id: targetOrderId,
-        name: `#${order || targetOrderId}`,
-        tracking: trackingInfo,
-      },
+      orders: [
+        {
+          id: targetOrderId,
+          name: `#${order || targetOrderId}`,
+          tracking: formatTracking(fulfill),
+        },
+      ],
     });
   } catch (error) {
     console.error("🔥 Unhandled error:", error.response?.data || error);
