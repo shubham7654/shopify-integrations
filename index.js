@@ -1407,8 +1407,72 @@ function corsForOrderTracking(req, res, next) {
 // --- 2️⃣ Order Tracking Endpoint ---
 app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
   try {
-    const { order, email, order_id } = req.query;
+    const { order, order_id, name, phone } = req.query;
 
+    // --- 2️⃣ If name + phone lookup ---
+    if (name && phone) {
+      try {
+        // Fetch orders by phone number
+        const response = await client.get({
+          path: "orders",
+          query: {
+            phone: phone,
+            status: "any",
+            limit: 50,
+          },
+        });
+    
+        const orders = response.body.orders || [];
+    
+        if (!orders.length) {
+          return res.status(404).json({ error: "No orders found with this phone number." });
+        }
+    
+        // Normalize name (case-insensitive)
+        const clean = (v) => v?.toString().trim().toLowerCase();
+    
+        // Find order where customer's name matches
+        const match = orders.find((o) => {
+          const customerName =
+            clean(o?.customer?.first_name + " " + o?.customer?.last_name);
+    
+          return customerName.includes(clean(name));
+        });
+    
+        if (!match) {
+          return res.status(404).json({
+            error: "Orders found for phone, but no matching name.",
+          });
+        }
+    
+        // Fetch fulfillment for matched order
+        const fulfillmentsRes = await client.get({
+          path: `orders/${match.id}/fulfillments`,
+        });
+    
+        const fulfillments = fulfillmentsRes.body.fulfillments || [];
+        const latest = fulfillments[fulfillments.length - 1] || {};
+    
+        return res.json({
+          order: {
+            id: match.id,
+            name: match.name,
+            tracking: {
+              tracking_number: latest.tracking_number || "Not Available",
+              tracking_url: latest.tracking_url || null,
+              courier: latest.tracking_company || "Not Specified",
+              status: latest.shipment_status || "pending",
+              estimated_delivery: latest.estimated_delivery_at || null,
+            },
+          },
+        });
+    
+      } catch (err) {
+        console.error("Name/Phone lookup error:", err.response?.data || err.message);
+        return res.status(500).json({ error: "Failed to fetch by Name + Phone" });
+      }
+    }
+    
     // --- Validate input ---
     if (!order && !order_id) {
       return res.status(400).json({
